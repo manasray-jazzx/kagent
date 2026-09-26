@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
 	"github.com/kagent-dev/kagent/go/core/pkg/sandboxbackend"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -26,8 +25,15 @@ func NewAgentsBackend(lifecycle *Lifecycle, ate *Client) *AgentsBackend {
 	return &AgentsBackend{Lifecycle: lifecycle, AteClient: ate}
 }
 
+// GetOwnedResourceTypes returns no types: ActorTemplate is not registered with the controller
+// manager's scheme on this branch (github.com/agent-substrate/substrate has no CRD for it -- see
+// actortemplate_desired_types.go's doc comment), so the generic reconciler's
+// apiutil.GVKForObject(&ActorTemplate{}, scheme) would fail hard at startup (not the graceful
+// "kind not installed" skip a REST-mapping failure gets) if this returned one. Reconciliation and
+// readiness for ActorTemplate go through reconcileActorTemplate/ComputeReady directly instead of
+// this generic owned-resource machinery.
 func (b *AgentsBackend) GetOwnedResourceTypes() []client.Object {
-	return []client.Object{&atev1alpha1.ActorTemplate{}}
+	return nil
 }
 
 // OwnedResourceTypesFor returns no types: substrate ActorTemplates are intentionally excluded
@@ -35,8 +41,7 @@ func (b *AgentsBackend) GetOwnedResourceTypes() []client.Object {
 // template. A config change creates a new config-hashed template; superseded templates and their
 // (suspended) goldens are stateful and pin no workers, so they are retained — not retired — and
 // removed only when the SandboxAgent is deleted (DeleteAllSandboxAgentActors +
-// CleanupSandboxAgentTemplate, plus owner-reference GC of the template objects). ActorTemplate
-// remains in GetOwnedResourceTypes for watches.
+// CleanupSandboxAgentTemplate).
 func (b *AgentsBackend) OwnedResourceTypesFor(_ v1alpha2.AgentObject) ([]client.Object, error) {
 	return nil, nil
 }
@@ -57,7 +62,7 @@ func (b *AgentsBackend) BuildSandbox(ctx context.Context, in sandboxbackend.Buil
 	if err != nil {
 		return nil, err
 	}
-	tmpl, err := b.Lifecycle.buildSandboxAgentActorTemplate(sa, wpKey, in.PodTemplate)
+	tmpl, err := b.Lifecycle.buildSandboxAgentActorTemplate(ctx, sa, wpKey, in.PodTemplate)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +82,7 @@ func (b *AgentsBackend) SessionDBURL(agent v1alpha2.AgentObject) string {
 }
 
 func (b *AgentsBackend) ReconcileActorTemplate(ctx context.Context, desired client.Object) error {
-	tmpl, ok := desired.(*atev1alpha1.ActorTemplate)
+	tmpl, ok := desired.(*ActorTemplate)
 	if !ok {
 		return fmt.Errorf("substrate sandbox backend cannot reconcile %T as an ActorTemplate", desired)
 	}
@@ -98,14 +103,14 @@ func (b *AgentsBackend) ComputeReady(ctx context.Context, cl client.Client, nn t
 	if b.Lifecycle == nil {
 		return metav1.ConditionUnknown, "SubstrateLifecycleNotConfigured", "substrate lifecycle is not configured"
 	}
-	tmpl, err := ResolveCurrentActorTemplate(ctx, cl, nn.Namespace, sa.Name)
+	tmpl, err := ResolveCurrentActorTemplate(ctx, cl, b.AteClient, nn.Namespace, sa.Name)
 	if err != nil {
 		return metav1.ConditionUnknown, "ActorTemplateListFailed", err.Error()
 	}
 	if tmpl == nil {
 		return metav1.ConditionFalse, "ActorTemplateNotFound", "ActorTemplate has not been generated yet"
 	}
-	if tmpl.Status.Phase != atev1alpha1.PhaseReady {
+	if tmpl.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag() == nil {
 		return metav1.ConditionFalse, "ActorTemplateNotReady", "ActorTemplate golden snapshot is not ready"
 	}
 	return metav1.ConditionTrue, "ActorTemplateReady", "ActorTemplate golden snapshot is ready"

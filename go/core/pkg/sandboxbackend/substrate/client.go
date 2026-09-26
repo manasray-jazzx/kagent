@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // Client wraps ate-api Control gRPC.
@@ -150,15 +151,40 @@ func (c *Client) CreateActor(ctx context.Context, atespace, actorID, tmplNS, tmp
 	defer cancel()
 	resp, err := c.ControlClient.CreateActor(ctx, &ateapipb.CreateActorRequest{
 		Actor: &ateapipb.Actor{
-			Metadata:               &ateapipb.ResourceMetadata{Atespace: atespace, Name: actorID},
-			ActorTemplateNamespace: tmplNS,
-			ActorTemplateName:      tmplName,
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: atespace, Name: actorID},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: tmplNS, Name: tmplName},
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
+	// A newly created actor has no EgressPolicy, and atenet-egress denies every
+	// outbound connection from an actor with none (confirmed via its own logs:
+	// "egress denied: actor has no egress policy"). golang-adk callbacks to
+	// kagent-controller (KAGENT_URL/KAGENT_API_URL, e.g. POST /api/tasks for
+	// task-state persistence) and any LLM-API calls the agent makes both need
+	// this. Allow-all mirrors internal/e2e/egresspolicy.go's EgressAllowAll,
+	// used by this repo's own tests that are not specifically about egress
+	// policy; a real deployment would scope this to the model backend's
+	// hostname plus kagent-controller instead.
+	if err := c.ensureActorEgressPolicy(ctx, atespace, actorID); err != nil {
+		return nil, fmt.Errorf("ensure egress policy for actor %s/%s: %w", atespace, actorID, err)
+	}
 	return resp, nil
+}
+
+func (c *Client) ensureActorEgressPolicy(ctx context.Context, atespace, actorID string) error {
+	_, err := c.ControlClient.CreateActorEgressPolicy(ctx, &ateapipb.CreateActorEgressPolicyRequest{
+		Actor: actorRef(atespace, actorID),
+		EgressPolicy: &ateapipb.EgressPolicy{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: atespace, Name: "default"},
+			Rules:    []*ateapipb.EgressRule{{All: &emptypb.Empty{}}},
+		},
+	})
+	if status.Code(err) == codes.AlreadyExists {
+		return nil
+	}
+	return err
 }
 
 func (c *Client) ResumeActor(ctx context.Context, atespace, actorID string) (*ateapipb.Actor, error) {
@@ -193,6 +219,37 @@ func (c *Client) EnsureAtespace(ctx context.Context, name string) error {
 	_, err := c.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{
 		Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}},
 	})
+	if err != nil && status.Code(err) == codes.AlreadyExists {
+		return nil
+	}
+	return err
+}
+
+// GetActorTemplateByName fetches an ActorTemplate by atespace/name, or (nil, nil) if it does
+// not exist -- callers that need to distinguish NotFound from other errors should call
+// ControlClient.GetActorTemplate directly instead.
+func (c *Client) GetActorTemplateByName(ctx context.Context, atespace, name string) (*ateapipb.ActorTemplate, error) {
+	ctx, cancel := c.callCtx(ctx)
+	defer cancel()
+	tmpl, err := c.ControlClient.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{
+		ActorTemplate: actorRef(atespace, name),
+	})
+	if status.Code(err) == codes.NotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get ActorTemplate %s/%s: %w", atespace, name, err)
+	}
+	return tmpl, nil
+}
+
+// CreateActorTemplate creates an ActorTemplate, treating AlreadyExists as success: ActorTemplates
+// are immutable on ate-api, so an existing template under this name is already what a caller
+// asking to (re)create it wants.
+func (c *Client) CreateActorTemplate(ctx context.Context, tmpl *ateapipb.ActorTemplate) error {
+	ctx, cancel := c.callCtx(ctx)
+	defer cancel()
+	_, err := c.ControlClient.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{ActorTemplate: tmpl})
 	if err != nil && status.Code(err) == codes.AlreadyExists {
 		return nil
 	}

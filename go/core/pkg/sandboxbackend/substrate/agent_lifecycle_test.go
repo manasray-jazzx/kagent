@@ -1,6 +1,7 @@
 package substrate
 
 import (
+	"context"
 	"testing"
 
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
@@ -237,7 +238,7 @@ func TestBuildSandboxAgentActorTemplate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			p := newTestLifecycle(t)
-			tmpl, err := p.buildSandboxAgentActorTemplate(tc.sa, wpKey, podTemplateFor(tc.container))
+			tmpl, err := p.buildSandboxAgentActorTemplate(context.Background(), tc.sa, wpKey, podTemplateFor(tc.container))
 			require.NoError(t, err)
 
 			require.Len(t, tmpl.Spec.Containers, 1)
@@ -304,7 +305,7 @@ func TestBuildSandboxAgentActorTemplateDurableDirSessions(t *testing.T) {
 			container.Image = pinnedImage
 			podTemplate := corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{container}}}
 
-			tmpl, err := p.buildSandboxAgentActorTemplate(tc.sa, wpKey, podTemplate)
+			tmpl, err := p.buildSandboxAgentActorTemplate(context.Background(), tc.sa, wpKey, podTemplate)
 			require.NoError(t, err)
 			require.Len(t, tmpl.Spec.Containers, 1)
 			c := tmpl.Spec.Containers[0]

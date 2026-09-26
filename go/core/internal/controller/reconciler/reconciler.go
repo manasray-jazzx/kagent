@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/hashicorp/go-multierror"
 	reconcilerutils "github.com/kagent-dev/kagent/go/core/internal/controller/reconciler/utils"
 	"github.com/kagent-dev/kagent/go/core/internal/controller/translator"
@@ -987,7 +986,7 @@ func (a *kagentReconciler) reconcileDesiredObjects(ctx context.Context, owner me
 		)
 
 		// Substrate ActorTemplate.spec is immutable, delegate to the sandbox backend to handle spec drift.
-		if _, ok := desired.(*atev1alpha1.ActorTemplate); ok {
+		if _, ok := desired.(*substrate.ActorTemplate); ok {
 			if r, ok := a.sandboxBackend.(actorTemplateReconciler); ok {
 				if err := r.ReconcileActorTemplate(ctx, desired); err != nil {
 					if errors.Is(err, substrate.ErrActorTemplateReconcilePending) {
@@ -1048,7 +1047,7 @@ type actorTemplateReconciler interface {
 // prune set so it is not garbage collected.
 func pruneOwnedActorTemplate(owned map[types.UID]client.Object, desired client.Object) {
 	for uid, obj := range owned {
-		if _, ok := obj.(*atev1alpha1.ActorTemplate); !ok {
+		if _, ok := obj.(*substrate.ActorTemplate); !ok {
 			continue
 		}
 		if obj.GetName() == desired.GetName() && obj.GetNamespace() == desired.GetNamespace() {

@@ -7,7 +7,6 @@ import (
 	"maps"
 	"strings"
 
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,6 +19,11 @@ import (
 // ErrActorTemplateReconcilePending indicates ActorTemplate reconciliation started
 // a multi-step recreate (e.g. golden-actor deletion) and callers should requeue.
 var ErrActorTemplateReconcilePending = errors.New("actor template reconciliation pending")
+
+// substrateActorTemplateAnnotation records, on the owning SandboxAgent/AgentHarness object, the
+// name of the ate-api ActorTemplate currently serving it -- see reconcileActorTemplate and
+// ResolveCurrentActorTemplate.
+const substrateActorTemplateAnnotation = "kagent.dev/substrate-actor-template"
 
 func (p *Lifecycle) ensureActorTemplate(ctx context.Context, ah *v1alpha2.AgentHarness, wpKey types.NamespacedName) (types.NamespacedName, error) {
 	key := types.NamespacedName{Namespace: ah.Namespace, Name: actorTemplateName(ah)}
@@ -34,81 +38,101 @@ func (p *Lifecycle) ensureActorTemplate(ctx context.Context, ah *v1alpha2.AgentH
 }
 
 // actorTemplateSpecEqual reports whether two ActorTemplate specs are semantically equal.
-func actorTemplateSpecEqual(a, b atev1alpha1.ActorTemplateSpec) bool {
+func actorTemplateSpecEqual(a, b ActorTemplateSpec) bool {
 	return apiequality.Semantic.DeepEqual(a, b)
 }
 
-// reconcileActorTemplate applies the desired ActorTemplate with immutable-spec semantics:
+// reconcileActorTemplate ensures desired exists as an ate-api ActorTemplate, created via
+// ateapipb.ControlClient.CreateActorTemplate rather than as a Kubernetes object:
+// github.com/agent-substrate/substrate (this branch) has no CRD for ActorTemplate at all --
+// see convertActorTemplate's doc comment for why, and for what this patch trades away relative
+// to the kagent-dev/substrate fork's CRD-based design it replaces.
 //
-//   - not found        -> create
-//   - spec matches     -> patch labels/annotations/owner refs only (never the spec)
-//   - spec drifts      -> delete the golden actor, delete the CR, recreate
+// ActorTemplates are immutable on ate-api (as they were as a CRD), so unlike the design this
+// replaces, a spec drift is NOT detected or reconciled here -- desired.Name already encodes the
+// shape hash (see sandboxAgentActorTemplateName), so a real shape change produces a new template
+// under a new name on the next call instead of mutating this one. An existing template under
+// this exact name is therefore always left untouched.
 //
-// On spec drift it performs at most one mutating step per call. When more work
-// remains it returns ErrActorTemplateReconcilePending so callers requeue.
-func reconcileActorTemplate(ctx context.Context, c client.Client, ate *Client, desired *atev1alpha1.ActorTemplate) error {
-	key := client.ObjectKeyFromObject(desired)
+// The current template's name is recorded as an annotation on the owning SandboxAgent/
+// AgentHarness object (found via desired's own lifecycle labels) so ResolveCurrentActorTemplate
+// can find it later without a CRD to list.
+func reconcileActorTemplate(ctx context.Context, c client.Client, ate *Client, desired *ActorTemplate) error {
+	atespace, name := desired.Namespace, desired.Name
 
-	existing := &atev1alpha1.ActorTemplate{}
-	err := c.Get(ctx, key, existing)
-	if apierrors.IsNotFound(err) {
-		if err := c.Create(ctx, desired); err != nil {
-			return fmt.Errorf("create ActorTemplate %s: %w", key, err)
-		}
-		return nil
-	}
+	existing, err := ate.GetActorTemplateByName(ctx, atespace, name)
 	if err != nil {
-		return fmt.Errorf("get ActorTemplate %s: %w", key, err)
+		return fmt.Errorf("get ActorTemplate %s/%s: %w", atespace, name, err)
+	}
+	if existing == nil {
+		proto, err := convertActorTemplate(ctx, c, desired)
+		if err != nil {
+			return fmt.Errorf("convert ActorTemplate %s/%s: %w", atespace, name, err)
+		}
+		if err := ate.EnsureAtespace(ctx, atespace); err != nil {
+			return fmt.Errorf("ensure atespace %q: %w", atespace, err)
+		}
+		if err := ate.CreateActorTemplate(ctx, proto); err != nil {
+			return fmt.Errorf("create ActorTemplate %s/%s: %w", atespace, name, err)
+		}
 	}
 
-	// If the spec is semantically equal, update the labels and annotations and owner references only.
-	if actorTemplateSpecEqual(existing.Spec, desired.Spec) {
-		mergedLabels := mergeLabels(existing.Labels, desired.Labels)
-		mergedAnnotations := mergeLabels(existing.Annotations, desired.Annotations)
-		if maps.Equal(existing.Labels, mergedLabels) &&
-			maps.Equal(existing.Annotations, mergedAnnotations) &&
-			apiequality.Semantic.DeepEqual(existing.OwnerReferences, desired.OwnerReferences) {
-			return nil
-		}
-		patch := client.MergeFrom(existing.DeepCopy())
-		existing.Labels = mergedLabels
-		existing.Annotations = mergedAnnotations
-		existing.OwnerReferences = desired.OwnerReferences
-		if err := c.Patch(ctx, existing, patch); err != nil {
-			return fmt.Errorf("patch ActorTemplate %s metadata: %w", key, err)
-		}
-		return nil
-	}
+	return recordCurrentActorTemplateName(ctx, c, desired)
+}
 
-	// Delete the golden actor since it is an external ate-api resource
-	if goldenID := strings.TrimSpace(existing.Status.GoldenActorID); goldenID != "" {
-		done, derr := deleteGoldenActor(ctx, ate, goldenID)
-		if derr != nil {
-			return fmt.Errorf("delete golden actor %q before recreating ActorTemplate %s: %w", goldenID, key, derr)
+// recordCurrentActorTemplateName annotates the owning SandboxAgent or AgentHarness (identified by
+// desired's own lifecycle labels -- see sandboxAgentLifecycleLabels/lifecycleLabels) with desired's
+// name, so ResolveCurrentActorTemplate can resolve "the template this agent currently uses"
+// without a CRD to list or select from. A missing owner (deleted mid-reconcile) is not an error.
+func recordCurrentActorTemplateName(ctx context.Context, c client.Client, desired *ActorTemplate) error {
+	if saName := desired.Labels[SandboxAgentLabelKey]; saName != "" {
+		var sa v1alpha2.SandboxAgent
+		key := types.NamespacedName{Namespace: desired.Namespace, Name: saName}
+		if err := c.Get(ctx, key, &sa); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("get SandboxAgent %s: %w", key, err)
 		}
-		if !done {
-			return ErrActorTemplateReconcilePending
-		}
+		return patchActorTemplateAnnotation(ctx, c, &sa, desired.Name)
 	}
-	if err := c.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete ActorTemplate %s for recreate: %w", key, err)
-	}
-	if err := c.Create(ctx, desired); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			// The previous CR is still terminating; recreate on the next pass.
-			return ErrActorTemplateReconcilePending
+	if ahName := desired.Labels["kagent.dev/agent-harness"]; ahName != "" {
+		var ah v1alpha2.AgentHarness
+		key := types.NamespacedName{Namespace: desired.Namespace, Name: ahName}
+		if err := c.Get(ctx, key, &ah); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("get AgentHarness %s: %w", key, err)
 		}
-		return fmt.Errorf("recreate ActorTemplate %s: %w", key, err)
+		return patchActorTemplateAnnotation(ctx, c, &ah, desired.Name)
 	}
 	return nil
 }
 
-func (p *Lifecycle) buildActorTemplate(ctx context.Context, ah *v1alpha2.AgentHarness, wpKey types.NamespacedName) (*atev1alpha1.ActorTemplate, error) {
+func patchActorTemplateAnnotation(ctx context.Context, c client.Client, obj client.Object, name string) error {
+	if obj.GetAnnotations()[substrateActorTemplateAnnotation] == name {
+		return nil
+	}
+	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
+	ann := obj.GetAnnotations()
+	if ann == nil {
+		ann = map[string]string{}
+	}
+	ann[substrateActorTemplateAnnotation] = name
+	obj.SetAnnotations(ann)
+	if err := c.Patch(ctx, obj, patch); err != nil {
+		return fmt.Errorf("record current ActorTemplate on %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
+	}
+	return nil
+}
+
+func (p *Lifecycle) buildActorTemplate(ctx context.Context, ah *v1alpha2.AgentHarness, wpKey types.NamespacedName) (*ActorTemplate, error) {
 	key := types.NamespacedName{Namespace: ah.Namespace, Name: actorTemplateName(ah)}
 
 	var (
 		startupScript  string
-		containerEnv   []atev1alpha1.EnvVar
+		containerEnv   []EnvVar
 		defaultImageFn func(acpSandboxImageConfig) (string, error)
 		containerName  string
 		err            error
@@ -157,16 +181,16 @@ func (p *Lifecycle) buildActorTemplate(ctx context.Context, ah *v1alpha2.AgentHa
 		}
 	}
 
-	desired := &atev1alpha1.ActorTemplate{
+	desired := &ActorTemplate{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      key.Name,
 			Namespace: key.Namespace,
 			Labels:    lifecycleLabels(ah),
 		},
-		Spec: atev1alpha1.ActorTemplateSpec{
+		Spec: ActorTemplateSpec{
 			PauseImage:   p.Defaults.PauseImage,
-			SandboxClass: atev1alpha1.SandboxClassGvisor,
-			Containers: []atev1alpha1.Container{
+			SandboxClass: SandboxClassGvisor,
+			Containers: []Container{
 				{
 					Name:  containerName,
 					Image: workloadImage,
@@ -178,15 +202,15 @@ func (p *Lifecycle) buildActorTemplate(ctx context.Context, ah *v1alpha2.AgentHa
 					Env: containerEnv,
 				},
 			},
-			WorkerSelector: workerSelectorForPool(wpKey),
-			SnapshotsConfig: atev1alpha1.SnapshotsConfig{
+			WorkerSelector: p.workerSelectorForPool(ctx, wpKey),
+			SnapshotsConfig: SnapshotsConfig{
 				Location: substrateSnapshotsLocation(ah),
 				// Mirror substrate's CRD defaults so kagent's spec-drift check
 				// (apiequality.Semantic.DeepEqual) treats them as equal to the
 				// values the API server fills in on admission — otherwise kagent
 				// re-creates the ActorTemplate every reconcile in a hot loop.
-				OnPause:  atev1alpha1.SnapshotScopeFull,
-				OnCommit: atev1alpha1.SnapshotScopeFull,
+				OnPause:  SnapshotScopeFull,
+				OnCommit: SnapshotScopeFull,
 			},
 		},
 	}
@@ -212,12 +236,9 @@ func (p *Lifecycle) ActorTemplateReady(ctx context.Context, key types.Namespaced
 }
 
 func (p *Lifecycle) actorTemplateReady(ctx context.Context, key types.NamespacedName) (bool, error) {
-	var tmpl atev1alpha1.ActorTemplate
-	if err := p.Client.Get(ctx, key, &tmpl); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
+	tmpl, err := p.AteClient.GetActorTemplateByName(ctx, key.Namespace, key.Name)
+	if err != nil {
 		return false, fmt.Errorf("get ActorTemplate %s: %w", key, err)
 	}
-	return tmpl.Status.Phase == atev1alpha1.PhaseReady, nil
+	return tmpl.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag() != nil, nil
 }

@@ -7,8 +7,10 @@ import (
 	"strings"
 
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -19,9 +21,13 @@ const (
 	defaultOpenClawContainer = "openclaw"
 
 	// Referenced by generated ActorTemplates to gate scheduling onto a WorkerPool.
-	// The kagent Helm chart stamps it on the WorkerPool it manages;
-	// externally-owned pools must carry it to remain eligible.
-	WorkerPoolLabelKey = "kagent.dev/worker-pool"
+	// github.com/kagent-dev/substrate's WorkerPool controller stamped
+	// "kagent.dev/worker-pool" on the pods it managed; github.com/agent-substrate/substrate's
+	// real atecontroller (cmd/atecontroller/internal/controllers/workerpool_apply.go) stamps
+	// "ate.dev/worker-pool" instead, so an ActorTemplate's WorkerSelector using the old key
+	// matches no worker at all -- ate-api-server's AssignWorker then reports "no free workers
+	// available" even when the pool has idle capacity.
+	WorkerPoolLabelKey = "ate.dev/worker-pool"
 )
 
 // LifecycleDefaults are cluster-wide defaults for generated ActorTemplate lifecycle.
@@ -76,9 +82,31 @@ type LifecycleState struct {
 	ActorTemplateReady bool
 }
 
-func workerSelectorForPool(wpKey types.NamespacedName) *metav1.LabelSelector {
+// workerSelectorForPool builds the ActorTemplate.WorkerSelector that will actually match workers
+// in wpKey's pool.
+//
+// github.com/agent-substrate/substrate's real ate-api scheduler (cmd/ateapi/internal/scheduling)
+// matches an ActorTemplate's WorkerSelector against ateapipb.Worker.Labels, and
+// cmd/atecontroller/internal/workersync/syncer.go's createOrUpdateWorker sets that field to
+// exactly pool.GetLabels() -- the WorkerPool object's own, admin-defined metadata.labels (e.g.
+// this cluster's "counter" pool carries {"workload": "counter"}, not any fixed-key convention).
+// So the only way to build a selector that matches is to read the real WorkerPool and copy its
+// labels; WorkerPoolLabelKey's fixed-key convention (kagent-dev/substrate's own WorkerPool
+// controller invariant) matches nothing here and silently produces
+// "no free workers available" on every resume.
+//
+// Falls back to the fixed-key convention when the pool can't be read (letting existing unit
+// tests that build templates without a live cluster/fake WorkerPool object keep passing
+// unchanged) or has no labels of its own.
+func (p *Lifecycle) workerSelectorForPool(ctx context.Context, wpKey types.NamespacedName) *metav1.LabelSelector {
 	if wpKey.Name == "" {
 		return nil
+	}
+	if p != nil && p.Client != nil {
+		var wp atev1alpha1.WorkerPool
+		if err := p.Client.Get(ctx, wpKey, &wp); err == nil && len(wp.GetLabels()) > 0 {
+			return &metav1.LabelSelector{MatchLabels: wp.GetLabels()}
+		}
 	}
 	return &metav1.LabelSelector{
 		MatchLabels: map[string]string{WorkerPoolLabelKey: wpKey.Name},
@@ -158,37 +186,44 @@ func truncateDNS1123To(s string, max int) string {
 	return s
 }
 
-// ResolveCurrentActorTemplate returns the ActorTemplate a SandboxAgent should currently serve
-// from: the template matching the agent's CURRENT desired config whose golden is Ready, else the
-// most-recently-desired Ready template (the previous config) while the desired one is still
-// building — the blue-green pivot, with no downtime and an atomic flip once the new golden is
-// Ready.
+// ResolveCurrentActorTemplate returns the ate-api ActorTemplate a SandboxAgent should currently
+// serve from.
 //
-// "Desired" is tracked by the kagent.dev/desired-generation annotation (the agent generation that
-// last applied the template), NOT creationTimestamp. Creation time is wrong for a flip-back to a
-// retained older config: that template's golden was built earlier, so by-creation ordering would
-// keep serving the newer (now-undesired) config. The desired template is always re-applied with
-// the current (highest) generation, so picking the highest-generation Ready template follows the
-// current config in both directions. Falls back to the highest-generation template when none is
-// Ready yet (first build). Returns (nil, nil) when no template exists.
-func ResolveCurrentActorTemplate(ctx context.Context, kube client.Client, namespace, agentName string) (*atev1alpha1.ActorTemplate, error) {
-	templates, err := listSandboxAgentActorTemplates(ctx, kube, namespace, agentName)
-	if err != nil {
-		return nil, err
+// github.com/agent-substrate/substrate (this branch) has no CRD for ActorTemplate, so unlike the
+// kagent-dev/substrate fork's design (a blue-green pivot across every retained, per-shape
+// template, selected by a kagent.dev/desired-generation annotation on each candidate), this reads
+// a single pointer -- the substrateActorTemplateAnnotation reconcileActorTemplate wrote on the
+// SandboxAgent itself the last time it successfully ensured a template -- and resolves that one
+// template via ate-api directly. A shape change still produces a new template under a new
+// (hash-derived) name and updates this pointer to it, so config changes are still picked up; what
+// is lost is keeping a superseded template's golden warm for in-flight sessions during a
+// rollout -- acceptable for proving this integration works at all, not for production blue-green
+// semantics. Returns (nil, nil) when no template has been generated yet.
+func ResolveCurrentActorTemplate(ctx context.Context, kube client.Client, ate *Client, namespace, agentName string) (*ateapipb.ActorTemplate, error) {
+	var sa v1alpha2.SandboxAgent
+	if err := kube.Get(ctx, types.NamespacedName{Namespace: namespace, Name: agentName}, &sa); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get SandboxAgent %s/%s: %w", namespace, agentName, err)
 	}
-	return selectCurrentActorTemplate(templates), nil
+	name := sa.Annotations[substrateActorTemplateAnnotation]
+	if name == "" {
+		return nil, nil
+	}
+	return ate.GetActorTemplateByName(ctx, namespace, name)
 }
 
 // selectCurrentActorTemplate selects the current actor as defined by the
 // highest-desired-generation template whose golden is Ready
-func selectCurrentActorTemplate(templates []*atev1alpha1.ActorTemplate) *atev1alpha1.ActorTemplate {
-	var desiredReady, desired *atev1alpha1.ActorTemplate
+func selectCurrentActorTemplate(templates []*ActorTemplate) *ActorTemplate {
+	var desiredReady, desired *ActorTemplate
 	for i := range templates {
 		t := templates[i]
 		if desired == nil || moreDesiredActorTemplate(t, desired) {
 			desired = t
 		}
-		if t.Status.Phase == atev1alpha1.PhaseReady {
+		if t.Status.Phase == PhaseReady {
 			if desiredReady == nil || moreDesiredActorTemplate(t, desiredReady) {
 				desiredReady = t
 			}
@@ -203,7 +238,7 @@ func selectCurrentActorTemplate(templates []*atev1alpha1.ActorTemplate) *atev1al
 // moreDesiredActorTemplate reports whether a is "more desired" than b: a higher desired-generation
 // wins (the template applied for the current config), with creationTimestamp as a tiebreaker for
 // legacy templates that predate the annotation.
-func moreDesiredActorTemplate(a, b *atev1alpha1.ActorTemplate) bool {
+func moreDesiredActorTemplate(a, b *ActorTemplate) bool {
 	ga, gb := actorTemplateDesiredGeneration(a), actorTemplateDesiredGeneration(b)
 	if ga != gb {
 		return ga > gb
@@ -212,7 +247,7 @@ func moreDesiredActorTemplate(a, b *atev1alpha1.ActorTemplate) bool {
 }
 
 // actorTemplateDesiredGeneration parses the desired-generation annotation; absent/invalid is 0.
-func actorTemplateDesiredGeneration(t *atev1alpha1.ActorTemplate) int64 {
+func actorTemplateDesiredGeneration(t *ActorTemplate) int64 {
 	g, err := strconv.ParseInt(t.Annotations[desiredGenerationAnnotation], 10, 64)
 	if err != nil {
 		return 0
@@ -220,25 +255,14 @@ func actorTemplateDesiredGeneration(t *atev1alpha1.ActorTemplate) int64 {
 	return g
 }
 
-// listSandboxAgentActorTemplates returns the non-terminating generated ActorTemplates for an agent.
-func listSandboxAgentActorTemplates(ctx context.Context, kube client.Client, namespace, agentName string) ([]*atev1alpha1.ActorTemplate, error) {
-	if kube == nil {
-		return nil, fmt.Errorf("kubernetes client is required")
-	}
-	list := &atev1alpha1.ActorTemplateList{}
-	if err := kube.List(ctx, list,
-		client.InNamespace(namespace),
-		client.MatchingLabels{SandboxAgentLabelKey: agentName},
-	); err != nil {
-		return nil, fmt.Errorf("list ActorTemplates for %s/%s: %w", namespace, agentName, err)
-	}
-	out := make([]*atev1alpha1.ActorTemplate, 0, len(list.Items))
-	for i := range list.Items {
-		if list.Items[i].DeletionTimestamp.IsZero() {
-			out = append(out, &list.Items[i])
-		}
-	}
-	return out, nil
+// listSandboxAgentActorTemplates is a stub: github.com/agent-substrate/substrate has no
+// ActorTemplate CRD to list (see ResolveCurrentActorTemplate). Its only remaining caller,
+// DeleteAllSandboxAgentActors' cleanup sweep, falls back to id-prefix matching when this returns
+// nothing, which is sufficient to find and delete a SandboxAgent's session actors -- it only loses
+// the extra match against a specific retained template, moot since ActorTemplates are no longer
+// retained as Kubernetes objects to enumerate in the first place.
+func listSandboxAgentActorTemplates(_ context.Context, _ client.Client, _, _ string) ([]*ActorTemplate, error) {
+	return nil, nil
 }
 
 // pinImageRef ensures image refs satisfy Substrate ActorTemplate validation (must contain "@").
@@ -255,8 +279,8 @@ func pinImageRef(image string) (string, error) {
 
 // actorTemplateEnvFromPodEnv converts pod env vars into ActorTemplate env vars.
 // Substrate ActorTemplates only support literal values, secretKeyRef, and configMapKeyRef.
-func actorTemplateEnvFromPodEnv(env []corev1.EnvVar) []atev1alpha1.EnvVar {
-	out := make([]atev1alpha1.EnvVar, 0, len(env))
+func actorTemplateEnvFromPodEnv(env []corev1.EnvVar) []EnvVar {
+	out := make([]EnvVar, 0, len(env))
 	seen := make(map[string]struct{}, len(env))
 	for _, e := range env {
 		if e.Name == "" {
@@ -275,19 +299,19 @@ func actorTemplateEnvFromPodEnv(env []corev1.EnvVar) []atev1alpha1.EnvVar {
 	return out
 }
 
-func sanitizeActorTemplateEnvVar(e corev1.EnvVar) *atev1alpha1.EnvVar {
+func sanitizeActorTemplateEnvVar(e corev1.EnvVar) *EnvVar {
 	if e.Value != "" {
-		return &atev1alpha1.EnvVar{
+		return &EnvVar{
 			Name:      e.Name,
 			ValueFrom: nil,
 			Value:     &e.Value,
 		}
 	}
 	if ref := e.ValueFrom.SecretKeyRef; ref != nil {
-		return &atev1alpha1.EnvVar{
+		return &EnvVar{
 			Name: e.Name,
-			ValueFrom: &atev1alpha1.EnvVarSource{
-				SecretKeyRef: &atev1alpha1.SecretKeySelector{
+			ValueFrom: &EnvVarSource{
+				SecretKeyRef: &SecretKeySelector{
 					Name:     ref.Name,
 					Key:      ref.Key,
 					Optional: ref.Optional,

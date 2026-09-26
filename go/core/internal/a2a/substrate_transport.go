@@ -7,10 +7,22 @@ import (
 	"github.com/kagent-dev/kagent/go/core/pkg/sandboxbackend/substrate"
 )
 
-// substrateAgentRoundTripper proxies A2A HTTP to an agent actor via atenet-router using Host routing.
+// atenetTargetActorHeader mirrors github.com/agent-substrate/substrate's
+// internal/atenet.TargetActorHeader ("ate-target-actor"), an internal package this module cannot
+// import. github.com/kagent-dev/substrate's own atenet-router apparently derived the target actor
+// from the Host header (the DNS-style name GatewayRouterTarget/ActorHost build); the real
+// atenet-router's ingress ext_proc handler (cmd/atenet/internal/router/ingress/ingress.go) only
+// ever reads this literal header (via atenet.ParseTargetActor), never the Host, so every request
+// built with Host alone was rejected with "invalid actor reference". Value format is
+// "<atespace>/<actorName>", enforced by atenet.ParseTargetActor.
+const atenetTargetActorHeader = "ate-target-actor"
+
+// substrateAgentRoundTripper proxies A2A HTTP to an agent actor via atenet-router.
 type substrateAgentRoundTripper struct {
 	router    *url.URL
 	actorHost string
+	atespace  string
+	actorID   string
 	base      http.RoundTripper
 }
 
@@ -22,7 +34,7 @@ func newSubstrateAgentRoundTripper(routerURL, atespace, actorID string, base htt
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	return &substrateAgentRoundTripper{router: target, actorHost: host, base: base}, nil
+	return &substrateAgentRoundTripper{router: target, actorHost: host, atespace: atespace, actorID: actorID, base: base}, nil
 }
 
 func (t *substrateAgentRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -35,5 +47,6 @@ func (t *substrateAgentRoundTripper) RoundTrip(req *http.Request) (*http.Respons
 	if t.actorHost != "" {
 		req.Host = t.actorHost
 	}
+	req.Header.Set(atenetTargetActorHeader, t.atespace+"/"+t.actorID)
 	return t.base.RoundTrip(req)
 }

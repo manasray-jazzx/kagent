@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
 	"github.com/kagent-dev/kagent/go/core/internal/utils"
 	"github.com/kagent-dev/kagent/go/core/pkg/sandboxbackend/openclaw"
@@ -57,7 +56,7 @@ var acpAgentSpecs = map[v1alpha2.AgentHarnessBackendType]acpAgentSpec{
 // agent child. Model credentials come from the harness ModelConfig as a
 // provider-conventional env var (e.g. OPENAI_API_KEY, ANTHROPIC_API_KEY)
 // resolved by ate-api from the referenced Secret.
-func (p *Lifecycle) buildAcpAgentActorStartup(ctx context.Context, ah *v1alpha2.AgentHarness, spec acpAgentSpec) (script string, env []atev1alpha1.EnvVar, err error) {
+func (p *Lifecycle) buildAcpAgentActorStartup(ctx context.Context, ah *v1alpha2.AgentHarness, spec acpAgentSpec) (script string, env []EnvVar, err error) {
 	if ah == nil {
 		return "", nil, fmt.Errorf("AgentHarness is required")
 	}

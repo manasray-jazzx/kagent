@@ -1,13 +1,13 @@
 package substrate
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
 	"github.com/kagent-dev/kagent/go/core/pkg/consts"
 	corev1 "k8s.io/api/core/v1"
@@ -60,10 +60,11 @@ const (
 )
 
 func (p *Lifecycle) buildSandboxAgentActorTemplate(
+	ctx context.Context,
 	sa *v1alpha2.SandboxAgent,
 	wpKey types.NamespacedName,
 	podTemplate corev1.PodTemplateSpec,
-) (*atev1alpha1.ActorTemplate, error) {
+) (*ActorTemplate, error) {
 	kagentContainer := findKagentContainer(podTemplate.Spec.Containers)
 	if kagentContainer == nil {
 		return nil, fmt.Errorf("pod template is missing the kagent container")
@@ -78,10 +79,10 @@ func (p *Lifecycle) buildSandboxAgentActorTemplate(
 		return nil, err
 	}
 
-	spec := atev1alpha1.ActorTemplateSpec{
+	spec := ActorTemplateSpec{
 		PauseImage:   p.Defaults.PauseImage,
-		SandboxClass: atev1alpha1.SandboxClassGvisor,
-		Containers: []atev1alpha1.Container{{
+		SandboxClass: SandboxClassGvisor,
+		Containers: []Container{{
 			Name:    defaultKagentContainer,
 			Image:   image,
 			Command: command,
@@ -92,18 +93,18 @@ func (p *Lifecycle) buildSandboxAgentActorTemplate(
 			// agent-card path mirrors the k8s Deployment readiness probe contract and
 			// is served by both ADKs and any A2A-conformant BYO image; substrate's
 			// default Readyz path (/readyz) is served by neither.
-			Readyz: &atev1alpha1.ContainerReadyz{
-				HTTPGet: &atev1alpha1.HTTPGetAction{
+			Readyz: &ContainerReadyz{
+				HTTPGet: &HTTPGetAction{
 					Path: "/.well-known/agent-card.json",
 					Port: substrateKagentListenPort,
 				},
 			},
 		}},
-		WorkerSelector: workerSelectorForPool(wpKey),
-		SnapshotsConfig: atev1alpha1.SnapshotsConfig{
+		WorkerSelector: p.workerSelectorForPool(ctx, wpKey),
+		SnapshotsConfig: SnapshotsConfig{
 			Location: sandboxAgentSnapshotsLocation(sa),
-			OnPause:  atev1alpha1.SnapshotScopeFull,
-			OnCommit: atev1alpha1.SnapshotScopeFull,
+			OnPause:  SnapshotScopeFull,
+			OnCommit: SnapshotScopeFull,
 		},
 	}
 	applyDurableDirSessionStore(&spec)
@@ -129,7 +130,7 @@ func (p *Lifecycle) buildSandboxAgentActorTemplate(
 		annotations[consts.ConfigHashAnnotation] = configHash
 	}
 
-	desired := &atev1alpha1.ActorTemplate{
+	desired := &ActorTemplate{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        sandboxAgentActorTemplateName(sa, actorTemplateHash),
 			Namespace:   sa.Namespace,
@@ -148,7 +149,7 @@ func (p *Lifecycle) buildSandboxAgentActorTemplate(
 // It covers everything in the spec (image digest, command, env including secretKeyRef names,
 // mounts, readyz, scopes, worker selector) and nothing outside it — Secret CONTENTS in
 // particular are invisible, which is exactly what makes config rollouts soft.
-func actorTemplateShapeHash(spec atev1alpha1.ActorTemplateSpec) (string, error) {
+func actorTemplateShapeHash(spec ActorTemplateSpec) (string, error) {
 	raw, err := json.Marshal(spec)
 	if err != nil {
 		return "", fmt.Errorf("hash ActorTemplate spec: %w", err)
@@ -163,17 +164,17 @@ func actorTemplateShapeHash(spec atev1alpha1.ActorTemplateSpec) (string, error) 
 // env from the live Secret — the only config-refresh channel on resume, which is what lets soft
 // config rollouts reach an existing session's actor (plan §4.2/§4.3). onPause stays Full so the
 // golden build and any future warm-pause tier keep a full snapshot available.
-func applyDurableDirSessionStore(spec *atev1alpha1.ActorTemplateSpec) {
-	spec.Volumes = append(spec.Volumes, atev1alpha1.Volume{
+func applyDurableDirSessionStore(spec *ActorTemplateSpec) {
+	spec.Volumes = append(spec.Volumes, Volume{
 		Name:         durableDataVolume,
-		VolumeSource: atev1alpha1.VolumeSource{DurableDir: &atev1alpha1.DurableDirVolumeSource{}},
+		VolumeSource: VolumeSource{DurableDir: &DurableDirVolumeSource{}},
 	})
 	c := &spec.Containers[0]
-	c.VolumeMounts = append(c.VolumeMounts, atev1alpha1.VolumeMount{
+	c.VolumeMounts = append(c.VolumeMounts, VolumeMount{
 		Name:      durableDataVolume,
 		MountPath: durableDataMount,
 	})
-	spec.SnapshotsConfig.OnCommit = atev1alpha1.SnapshotScopeData
+	spec.SnapshotsConfig.OnCommit = SnapshotScopeData
 }
 
 func findKagentContainer(containers []corev1.Container) *corev1.Container {
@@ -213,6 +214,16 @@ func buildSubstrateKagentContainerCommand(sa *v1alpha2.SandboxAgent, container *
 		// export window; the batch exporter's timer never fires in the ~1s an
 		// actor lives past its response. Ordinary Deployments leave this off.
 		{Name: "KAGENT_PRE_RESPONSE_TRACE_FLUSH", Value: "true"},
+	}
+	// KAGENT_API_URL: some golang-adk builds read this name instead of
+	// KAGENT_URL (env.KagentURL, set below via kagentContainer.Env, mirrors
+	// manifest_builder.go's http://<controller>.<namespace>:8083). Alias it
+	// here rather than in the shared translator so this stays substrate-local.
+	for _, e := range container.Env {
+		if e.Name == "KAGENT_URL" && e.Value != "" {
+			env = append(env, corev1.EnvVar{Name: "KAGENT_API_URL", Value: e.Value})
+			break
+		}
 	}
 
 	spec := sa.GetAgentSpec()

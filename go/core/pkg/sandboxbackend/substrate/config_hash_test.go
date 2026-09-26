@@ -88,7 +88,7 @@ func TestBuildActorTemplateShapeHashIdentity(t *testing.T) {
 	const img2 = "registry.example/app@sha256:2222222"
 	wpKey := types.NamespacedName{Namespace: "kagent", Name: "kagent-default"}
 
-	tmpl, err := p.buildSandboxAgentActorTemplate(sa, wpKey, podFor("255", img1))
+	tmpl, err := p.buildSandboxAgentActorTemplate(context.Background(), sa, wpKey, podFor("255", img1))
 	require.NoError(t, err)
 	shapeHash := tmpl.Annotations[actorTemplateHashAnnotation]
 	require.NotEmpty(t, shapeHash)
@@ -97,13 +97,13 @@ func TestBuildActorTemplateShapeHashIdentity(t *testing.T) {
 
 	// A soft config change (new config hash, same rendered shape) must keep the SAME template —
 	// that is what lets existing sessions keep their actor (and durable dir) across rollouts.
-	softChange, err := p.buildSandboxAgentActorTemplate(sa, wpKey, podFor("256", img1))
+	softChange, err := p.buildSandboxAgentActorTemplate(context.Background(), sa, wpKey, podFor("256", img1))
 	require.NoError(t, err)
 	require.Equal(t, tmpl.Name, softChange.Name, "config-only change must not fan out a new template")
 	require.Equal(t, shapeHash, softChange.Annotations[actorTemplateHashAnnotation])
 
 	// A actor template shape change (new image digest) must fan out a new template + golden.
-	shapeChange, err := p.buildSandboxAgentActorTemplate(sa, wpKey, podFor("256", img2))
+	shapeChange, err := p.buildSandboxAgentActorTemplate(context.Background(), sa, wpKey, podFor("256", img2))
 	require.NoError(t, err)
 	require.NotEqual(t, tmpl.Name, shapeChange.Name, "image change must produce a new template")
 	require.NotEqual(t, shapeHash, shapeChange.Annotations[actorTemplateHashAnnotation])

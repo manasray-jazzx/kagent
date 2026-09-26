@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"reflect"
 
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,7 +30,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	"github.com/kagent-dev/kagent/go/api/v1alpha2"
@@ -112,12 +110,14 @@ func (r *SandboxAgentController) SetupWithManager(mgr ctrl.Manager) error {
 	if err != nil {
 		return err
 	}
-	if r.substrateConfigured() {
-		build = build.Watches(
-			&atev1alpha1.ActorTemplate{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueSandboxAgentForSubstrateResource),
-		)
-	}
+	// No Watches() for atev1alpha1.ActorTemplate here: github.com/agent-substrate/substrate
+	// (unlike the kagent-dev/substrate fork this was built against) has no CRD for it at all, and
+	// registering a Watch for a kind the REST mapper can't resolve fails this controller's cache
+	// sync -- which controller-runtime treats as fatal for the whole manager, not just this
+	// controller, crashing every other controller in the process too. See
+	// docs/dev/eks-aks-workaround.md in agent-substrate/substrate for how this was found (creating
+	// a single SandboxAgent was enough to crash kagent-controller) and reconcileActorTemplate/
+	// ResolveCurrentActorTemplate in pkg/sandboxbackend/substrate for the RPC-based replacement.
 	build, err = addCommonAgentWatches(build, mgr, agentWatchFinders{
 		modelConfig:     r.sandboxAgentDependencyFinder("failed to list sandboxagents for ModelConfig watch", usesModelConfig),
 		remoteMCPServer: r.sandboxAgentDependencyFinder("failed to list sandboxagents for RemoteMCPServer watch", usesRemoteMCPServer),

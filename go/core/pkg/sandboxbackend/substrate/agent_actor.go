@@ -82,9 +82,9 @@ func (b *SandboxAgentActorBackend) EnsureSessionActor(ctx context.Context, sa *v
 		}
 	}
 
-	switch actor.GetStatus() {
-	case ateapipb.Actor_STATUS_SUSPENDED, ateapipb.Actor_STATUS_UNSPECIFIED,
-		ateapipb.Actor_STATUS_PAUSED, ateapipb.Actor_STATUS_PAUSING:
+	switch actor.GetStatus().GetState() {
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ateapipb.ActorState_ACTOR_STATE_UNSPECIFIED,
+		ateapipb.ActorState_ACTOR_STATE_PAUSED, ateapipb.ActorState_ACTOR_STATE_PAUSING:
 		// PAUSED/PAUSING keep a node-local snapshot; ResumeActor brings them back
 		// the same as a suspended actor. RUNNING/RESUMING actors need nothing.
 		_, err = b.client.ResumeActor(ctx, atespace, actorID)
@@ -121,8 +121,8 @@ func (b *SandboxAgentActorBackend) SuspendSessionActor(ctx context.Context, sa *
 		}
 		return fmt.Errorf("substrate GetActor %q: %w", actorID, err)
 	}
-	switch actor.GetStatus() {
-	case ateapipb.Actor_STATUS_RUNNING, ateapipb.Actor_STATUS_RESUMING, ateapipb.Actor_STATUS_SUSPENDING:
+	switch actor.GetStatus().GetState() {
+	case ateapipb.ActorState_ACTOR_STATE_RUNNING, ateapipb.ActorState_ACTOR_STATE_RESUMING, ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
 		if err := b.client.SuspendActor(ctx, atespace, actorID); err != nil && status.Code(err) != codes.NotFound {
 			return fmt.Errorf("substrate SuspendActor %q: %w", actorID, err)
 		}
@@ -154,14 +154,14 @@ func (b *SandboxAgentActorBackend) DeleteSandboxAgentSessionActor(ctx context.Co
 // record and rebuilds the workload spec from it — which is what pins a session to the shape it
 // was created under for its entire life.
 func (b *SandboxAgentActorBackend) sessionActorRef(ctx context.Context, sa *v1alpha2.SandboxAgent, sessionID string) (actorID, templateName string, err error) {
-	tmpl, err := ResolveCurrentActorTemplate(ctx, b.kube, sa.Namespace, sa.Name)
+	tmpl, err := ResolveCurrentActorTemplate(ctx, b.kube, b.client, sa.Namespace, sa.Name)
 	if err != nil {
 		return "", "", err
 	}
 	if tmpl == nil {
 		return "", "", fmt.Errorf("no ActorTemplate generated yet for SandboxAgent %s/%s", sa.Namespace, sa.Name)
 	}
-	return SandboxAgentSessionActorID(sa, sessionID), tmpl.Name, nil
+	return SandboxAgentSessionActorID(sa, sessionID), tmpl.GetMetadata().GetName(), nil
 }
 
 // DeleteAllSandboxAgentActors deletes legacy per-agent actors and all session actors for a SandboxAgent.
@@ -215,8 +215,8 @@ func (b *SandboxAgentActorBackend) DeleteAllSandboxAgentActors(ctx context.Conte
 // fallback), then falls back to id-prefix matching as a backstop for orphaned actors whose
 // template was already deleted.
 func actorBelongsToSandboxAgent(sa *v1alpha2.SandboxAgent, actor *ateapipb.Actor, prefix string, ownedTemplates map[string]struct{}) bool {
-	if actor.GetActorTemplateNamespace() == sa.Namespace {
-		if _, ok := ownedTemplates[actor.GetActorTemplateName()]; ok {
+	if actor.GetActorTemplate().GetAtespace() == sa.Namespace {
+		if _, ok := ownedTemplates[actor.GetActorTemplate().GetName()]; ok {
 			return true
 		}
 	}
