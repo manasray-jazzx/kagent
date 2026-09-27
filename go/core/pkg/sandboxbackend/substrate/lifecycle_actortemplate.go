@@ -57,6 +57,17 @@ func actorTemplateSpecEqual(a, b ActorTemplateSpec) bool {
 // The current template's name is recorded as an annotation on the owning SandboxAgent/
 // AgentHarness object (found via desired's own lifecycle labels) so ResolveCurrentActorTemplate
 // can find it later without a CRD to list.
+//
+// Returns ErrActorTemplateReconcilePending whenever the template's golden snapshot isn't ready
+// yet (whether just-created or pre-existing), so the caller (reconcileDesiredObjects ->
+// ReconcileKagentSandboxAgent -> SandboxAgentController.Reconcile) requeues with
+// RequeueAfter: agentHarnessNotReadyRequeue instead of relying on a watch to notice the change --
+// there is none, since ActorTemplate/its golden actor are RPC-only, not a Kubernetes object.
+// Confirmed live: without this, a SandboxAgent got stuck reporting Ready:False forever once its
+// very first reconcile ran before the golden snapshot finished baking, because nothing ever
+// reconciled it again -- proven by a continuous log stream across 96+ seconds showing exactly one
+// reconcile attempt total, and confirmed fixed by a manager restart (which forces one fresh
+// reconcile per object at startup) reliably flipping it to Ready:True every time.
 func reconcileActorTemplate(ctx context.Context, c client.Client, ate *Client, desired *ActorTemplate) error {
 	atespace, name := desired.Namespace, desired.Name
 
@@ -75,9 +86,20 @@ func reconcileActorTemplate(ctx context.Context, c client.Client, ate *Client, d
 		if err := ate.CreateActorTemplate(ctx, proto); err != nil {
 			return fmt.Errorf("create ActorTemplate %s/%s: %w", atespace, name, err)
 		}
+		existing, err = ate.GetActorTemplateByName(ctx, atespace, name)
+		if err != nil {
+			return fmt.Errorf("get ActorTemplate %s/%s after create: %w", atespace, name, err)
+		}
 	}
 
-	return recordCurrentActorTemplateName(ctx, c, desired)
+	if err := recordCurrentActorTemplateName(ctx, c, desired); err != nil {
+		return err
+	}
+
+	if existing.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag() == nil {
+		return ErrActorTemplateReconcilePending
+	}
+	return nil
 }
 
 // recordCurrentActorTemplateName annotates the owning SandboxAgent or AgentHarness (identified by
