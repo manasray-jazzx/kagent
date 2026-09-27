@@ -82,6 +82,19 @@ func (r *SandboxAgentController) Reconcile(ctx context.Context, req ctrl.Request
 		if res, err := r.reconcileSubstrateSandboxAgent(ctx, &sa); err != nil || !res.IsZero() {
 			return res, err
 		}
+		// A deleting SandboxAgent whose substrate cleanup just returned a zero
+		// Result (no error, no requeue -- e.g. the finalizer was just removed, or
+		// there was none to begin with) must stop here. Falling through to the
+		// generic reconciler below would call AdkTranslator/BuildSandbox and
+		// re-materialize the ActorTemplate this delete path exists to clean up:
+		// confirmed live -- CleanupSandboxAgentTemplate's DeleteActorTemplate
+		// succeeded, and 6ms later a CreateActorTemplate call from this same
+		// reconcile recreated the exact same template, orphaned forever since
+		// the SandboxAgent it belonged to no longer existed to ever clean it up
+		// again.
+		if !sa.DeletionTimestamp.IsZero() {
+			return ctrl.Result{}, nil
+		}
 	}
 
 	if err := r.Reconciler.ReconcileKagentSandboxAgent(ctx, req); err != nil {
